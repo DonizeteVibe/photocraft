@@ -154,6 +154,8 @@ pub type ExportFn = Box<dyn Fn(&Document, &str, &ExportSettings) -> Result<(Vec<
 /// The picked file's name and its bytes, or why it could not be read (shown like any other open
 /// failure); `None` when the dialog was cancelled.
 pub type PickOpenFn = Box<dyn FnMut() -> Option<(String, Result<Vec<u8>, String>)>>;
+/// Request an asynchronous platform document picker. The selection returns through [`Inbox`].
+pub type RequestOpenFn = Box<dyn FnMut() -> Result<(), String>>;
 pub type PickSaveFn = Box<dyn FnMut(&str) -> Option<String>>;
 pub type WriteFn = Box<dyn FnMut(&str, &[u8]) -> Result<(), String>>;
 /// Read bytes through the desktop control session's authorized read root.
@@ -209,6 +211,8 @@ pub struct Services {
     pub export: Option<ExportFn>,
     /// Show an "open file" dialog; returns (name, bytes).
     pub pick_open: Option<PickOpenFn>,
+    /// Request an asynchronous platform document picker; its result arrives through `inbox`.
+    pub request_open: Option<RequestOpenFn>,
     /// Show a "save file" dialog; returns a path/name to write.
     pub pick_save: Option<PickSaveFn>,
     /// Write bytes to a path (native) or trigger a download (web).
@@ -480,7 +484,7 @@ impl PhotocraftApp {
 
     /// Draw the document canvas on the GPU (custom WGSL shader) instead of via egui textures.
     /// Call from the app creator with `cc.wgpu_render_state`; without it the CPU path is used.
-    pub fn set_wgpu(&mut self, rs: eframe::egui_wgpu::RenderState) {
+    pub fn set_wgpu(&mut self, rs: egui_wgpu::RenderState) {
         // Preferences › Performance › cache tile size (PHOTOCRAFT_GPU_TILE still overrides).
         let tile = self.session.prefs().performance.cache_tile_size;
         // Escaped driver/setup panics must leave the session and CPU canvas alive.
@@ -502,6 +506,12 @@ impl PhotocraftApp {
         self.perf.gpu_info.canvas = "gpu".into();
         self.gpu = Some(gpu);
         self.prefs_rt.gpu_style = None;
+    }
+
+    /// Drop GPU canvas resources before an Android surface or device is destroyed.
+    pub fn clear_wgpu(&mut self) {
+        self.gpu = None;
+        self.perf.gpu_info.canvas = "cpu".into();
     }
 
     /// Whether the document canvas currently draws on the GPU (false on the CPU path, and after
@@ -708,9 +718,15 @@ impl PhotocraftApp {
     /// File › Open: the platform dialog returns the chosen file's path (native; the web delivers
     /// picks through the inbox instead).
     pub fn open_dialog_file(&mut self) {
-        let Some((path, bytes)) = self.services.pick_open.as_mut().and_then(|f| f()) else { return };
-        if let Err(e) = bytes.and_then(|bytes| self.open_file(&path, &bytes)) {
-            self.open_failed(&file_open::display_name(&path), &e);
+        if let Some(pick_open) = self.services.pick_open.as_mut() {
+            let Some((path, bytes)) = pick_open() else { return };
+            if let Err(e) = bytes.and_then(|bytes| self.open_file(&path, &bytes)) {
+                self.open_failed(&file_open::display_name(&path), &e);
+            }
+        } else if let Some(request_open) = self.services.request_open.as_mut()
+            && let Err(error) = request_open()
+        {
+            self.open_failed("document picker", &error);
         }
     }
 
@@ -842,8 +858,9 @@ impl PhotocraftApp {
     }
 }
 
-impl eframe::App for PhotocraftApp {
-    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+impl PhotocraftApp {
+    /// Run the app's per-frame state and event handling without an eframe runner.
+    pub fn frame_logic(&mut self, ctx: &egui::Context) {
         i18n::set_current(i18n::Lang::from_pref(&self.session.prefs().interface.language));
         if !self.styled {
             Self::setup_context(ctx, self.ui.theme);
@@ -909,12 +926,14 @@ impl eframe::App for PhotocraftApp {
         }
     }
 
-    fn raw_input_hook(&mut self, ctx: &egui::Context, raw_input: &mut egui::RawInput) {
+    /// Apply app-specific egui input adjustments before a frame is run.
+    pub fn prepare_raw_input(&mut self, ctx: &egui::Context, raw_input: &mut egui::RawInput) {
         shortcuts::clipboard_keys(ctx, ctx.text_edit_focused() || self.ui.text_edit.is_some(), raw_input);
         raw_input.events.extend(self.take_synthetic_step());
     }
 
-    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+    /// Draw the app's UI into a root egui UI.
+    pub fn frame_ui(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
         i18n::set_current(i18n::Lang::from_pref(&self.session.prefs().interface.language));
         // Fonts registered via set_fonts only take effect next frame; named families would panic now.
@@ -979,6 +998,21 @@ impl eframe::App for PhotocraftApp {
                 let _ = w.send(serde_json::json!({"ok": true, "result": null}));
             }
         }
+    }
+}
+
+#[cfg(feature = "eframe")]
+impl eframe::App for PhotocraftApp {
+    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.frame_logic(ctx);
+    }
+
+    fn raw_input_hook(&mut self, ctx: &egui::Context, raw_input: &mut egui::RawInput) {
+        self.prepare_raw_input(ctx, raw_input);
+    }
+
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        self.frame_ui(ui);
     }
 }
 
@@ -1451,5 +1485,30 @@ mod clipboard_tests {
         }
         assert_eq!(reads.load(std::sync::atomic::Ordering::SeqCst), 0, "the OS clipboard is read only on an explicit paste");
         assert!(h.state().session.clipboard.is_none());
+    }
+}
+
+#[cfg(test)]
+mod async_open_tests {
+    use super::{PhotocraftApp, Services};
+    use photocraft_engine::Session;
+    use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn open_requests_asynchronous_platform_picker() {
+        let requested = Arc::new(Mutex::new(false));
+        let request_flag = requested.clone();
+        let services = Services {
+            request_open: Some(Box::new(move || {
+                *request_flag.lock().unwrap() = true;
+                Ok(())
+            })),
+            ..Default::default()
+        };
+        let mut app = PhotocraftApp::new(Session::new(), services);
+
+        app.open_dialog_file();
+
+        assert!(*requested.lock().unwrap());
     }
 }
